@@ -1,38 +1,139 @@
-# Stock Data Scraper and Analyzer
+import argparse
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
+import openpyxl
+from openpyxl.chart import LineChart, Reference
+import time
 
-This program is designed to scrape stock data from `stooq.pl`, a popular Polish website featuring stock quotes. It extracts stock prices for a specified ticker over the last 360 days, saves this data to an Excel file, and generates charts to visualize price changes over 90, 180, and 360 days.
+def init_driver():
+    """Initialize the Selenium WebDriver."""
+    return webdriver.Firefox()
 
-## Features
+def scrape_stock_data(driver, ticker):
+    """
+    Scrape stock data for the given ticker.
 
-- **Data Scraping**: Utilizes Selenium WebDriver to navigate `stooq.pl` and extract stock data.
-- **Data Processing**: Converts the scraped data into a structured format and translates Polish date strings to English.
-- **Excel Integration**: Saves the processed data into an Excel file and adds line charts for visual analysis.
-- **Chart Generation**: Creates three line charts representing stock price movements over different periods (90, 180, and 360 days).
+    Args:
+        driver: The Selenium WebDriver.
+        ticker: The stock ticker symbol.
 
-## How It Works
+    Returns:
+        A pandas DataFrame with the scraped data.
+    """
+    base_url = f'https://stooq.pl/q/d/?s={ticker}&i=d'
+    data = []
+    page_number = 1
+    while True:
+        current_url = f"{base_url}&l={page_number}" if page_number > 1 else base_url
+        driver.get(current_url)
+        consent_if_needed(driver, page_number)
+        
+        # Wait for the dynamic content to load
+        time.sleep(5)  # Adjust this delay as necessary
+        
+        rows = driver.find_elements(By.XPATH, "//table[@id='fth1']/tbody/tr")
+        if not rows or len(data) >= 360:
+            break
+        for row in rows:
+            cells = row.find_elements(By.TAG_NAME, 'td')
+            if len(cells) == 9:  # Ensuring row has all data
+                row_data = [cell.text for cell in cells[1:]]  # Skip first cell (index)
+                data.append(row_data)
+        page_number += 1
+    
+    columns = ['Date', 'Opening', 'High', 'Low', 'Closing Price', 'Change %', 'Change Nominal', 'Volume']
+    return pd.DataFrame(data, columns=columns)
 
-1. **Initialization**: The program begins by initializing the Selenium WebDriver, set to use Firefox by default.
+def consent_if_needed(driver, page_number):
+    """
+    Click the consent button on the page if it is found.
 
-2. **Data Scraping**: 
-   - It navigates to the specific URL for the stock ticker provided by the user.
-   - It handles pagination to collect up to 360 days of stock data, dealing with consent buttons as necessary.
-   - The data includes the date, opening, high, low, closing price, change in percentage, nominal change, and volume.
+    Args:
+        driver: The Selenium WebDriver.
+        page_number: The current page number being scraped.
+    """
+    if page_number == 1:
+        try:
+            consent_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".fc-button.fc-cta-consent.fc-primary-button")))
+            consent_button.click()
+        except TimeoutException:
+            pass  # Consent button not found or not clickable
 
-3. **Data Processing**:
-   - Translates Polish date strings into a standard "YYYY-MM-DD" format.
-   - Converts the closing price to a numeric format, ensuring it can be used for calculations and charting.
+def process_data_frame(df):
+    """
+    Process the DataFrame by converting date formats and data types.
 
-4. **Excel File Creation**:
-   - The program saves the structured data to an Excel file named `scraped_stock_data_[TICKER]_360_days.xlsx`.
-   - It then processes this data to create a new sheet within the Excel file dedicated to charts.
+    Args:
+        df: The pandas DataFrame to process.
+    """
+    df['Date'] = df['Date'].apply(translate_date)
+    df['Closing Price'] = pd.to_numeric(df['Closing Price'].str.replace(',', '.'), errors='coerce')
 
-5. **Chart Generation**:
-   - Generates line charts for three periods: 90, 180, and 360 days.
-   - Each chart displays the closing prices over its respective time period, providing a visual representation of stock price trends.
+def save_to_excel(df, ticker):
+    """
+    Save the DataFrame to an Excel file and add charts based on the data.
 
-## Usage
+    Args:
+        df: The pandas DataFrame to save.
+        ticker: The stock ticker symbol for naming the file.
+    
+    Returns:
+        The filename of the saved Excel file.
+    """
+    excel_filename = f'scraped_stock_data_{ticker}_360_days.xlsx'
+    df.to_excel(excel_filename, sheet_name='Stock Data', index=False)
+    
+    wb = openpyxl.load_workbook(excel_filename)
+    ws_data = wb['Stock Data']
+    ws_charts = wb.create_sheet('Charts')
 
-Ensure you have the required Python libraries installed: `selenium`, `pandas`, `openpyxl`, and their dependencies.
+    for i, days in enumerate([30, 180, 360], start=1):
+        start_row = max(2, ws_data.max_row - days + 1)
+        end_row = ws_data.max_row
+        data = Reference(ws_data, min_col=5, min_row=start_row, max_row=end_row)
+        categories = Reference(ws_data, min_col=1, min_row=start_row, max_row=end_row)
 
-```bash
-python stock_webscraper.py PGE
+        chart = LineChart()
+        chart.add_data(data, titles_from_data=True)
+        chart.set_categories(categories)
+        chart.title = f'Closing Prices Last {days} Days'
+        ws_charts.add_chart(chart, f'A{15 * (i - 1) + 1}')
+
+    wb.save(excel_filename)
+    return excel_filename
+
+def translate_date(date_str):
+    """
+    Translate Polish date string to English.
+
+    Args:
+        date_str: The date string in Polish.
+
+    Returns:
+        The date string in "YYYY-MM-DD" format.
+    """
+    polish_to_english = {
+        'sty': '01', 'lut': '02', 'mar': '03', 'kwi': '04',
+        'maj': '05', 'cze': '06', 'lip': '07', 'sie': '08',
+        'wrz': '09', 'paź': '10', 'lis': '11', 'gru': '12'
+    }
+    day, month_abbr, year = date_str.split()
+    month = polish_to_english[month_abbr.lower()]
+    return f"{year}-{month}-{day.zfill(2)}"
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Scrape stock data')
+    parser.add_argument('ticker', type=str, help='Stock ticker symbol')
+    args = parser.parse_args()
+
+    driver = init_driver()
+    data_df = scrape_stock_data(driver, args.ticker)
+    driver.quit()
+
+    process_data_frame(data_df)
+    excel_filename = save_to_excel(data_df, args.ticker)
+    print(f"Excel file with charts saved as {excel_filename}.")
